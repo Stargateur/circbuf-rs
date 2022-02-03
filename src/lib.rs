@@ -215,13 +215,17 @@ impl CircBuf {
         self.buf.len() - 1
     }
 
+    fn cacl_len(read_cursor: usize, write_cursor: usize, len: usize) -> usize {
+        if write_cursor < read_cursor {
+            len - read_cursor + write_cursor
+        } else {
+            write_cursor - read_cursor
+        }
+    }
+
     /// Get the number of bytes stored in the buffer.
     pub fn len(&self) -> usize {
-        if self.write_cursor < self.read_cursor {
-            return self.buf.len() - self.read_cursor + self.write_cursor;
-        }
-
-        self.write_cursor - self.read_cursor
+        Self::cacl_len(self.read_cursor, self.write_cursor, self.buf.len())
     }
 
     /// Get the number of bytes available in the buffer.
@@ -320,9 +324,13 @@ impl CircBuf {
         Ok(())
     }
 
+    fn cacl_read(read_cursor: usize, num: usize, len: usize) -> usize {
+        (read_cursor + num) % len
+    }
+
     /// Advance the buffer's read cursor `num` bytes.
     pub fn advance_read(&mut self, num: usize) {
-        self.read_cursor = (self.read_cursor + num) % self.buf.len();
+        self.read_cursor = Self::cacl_read(self.read_cursor, num, self.buf.len());
     }
 
     /// Advance the buffer's write cursor `num` bytes.
@@ -479,6 +487,75 @@ impl CircBuf {
         let len = self.len();
         self.get_bytes_upto_size(len)
     }
+
+    /// Return a reader that doesn't advance the read cursor.
+    pub fn reader_peek(&self) -> CircBufPeekReader {
+        CircBufPeekReader {
+            inner: self,
+            peek_cursor: self.read_cursor,
+        }
+    }
+
+    fn read_peek(
+        src: &[u8],
+        dest: &mut [u8],
+        len: usize,
+        read_cursor: usize,
+        write_cursor: usize,
+    ) -> io::Result<usize> {
+        let num_to_read = if len < dest.len() { len } else { dest.len() };
+
+        if write_cursor < read_cursor {
+            // check if we need to wrap around the buffer to read num_to_read bytes
+            let num_to_end = src.len() - read_cursor;
+            let min = if num_to_read < num_to_end {
+                num_to_read
+            } else {
+                num_to_end
+            };
+
+            unsafe { copy_nonoverlapping(&src[read_cursor], &mut dest[0], min) };
+
+            if min != num_to_read {
+                unsafe { copy_nonoverlapping(&src[0], &mut dest[min], num_to_read - min) };
+            }
+        } else {
+            unsafe { copy_nonoverlapping(&src[read_cursor], &mut dest[0], num_to_read) };
+        }
+
+        Ok(num_to_read)
+    }
+}
+
+pub struct CircBufPeekReader<'a> {
+    inner: &'a CircBuf,
+    peek_cursor: usize,
+}
+
+impl<'a> io::Read for CircBufPeekReader<'a> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let len = CircBuf::cacl_len(
+            self.peek_cursor,
+            self.inner.write_cursor,
+            self.inner.buf.len(),
+        );
+
+        if len == 0 {
+            Ok(0)
+        } else {
+            let readed = CircBuf::read_peek(
+                &self.inner.buf,
+                buf,
+                len,
+                self.peek_cursor,
+                self.inner.write_cursor,
+            )?;
+
+            self.peek_cursor = CircBuf::cacl_read(self.peek_cursor, readed, self.inner.buf.len());
+
+            Ok(readed)
+        }
+    }
 }
 
 impl io::Read for CircBuf {
@@ -486,32 +563,15 @@ impl io::Read for CircBuf {
         let len = self.len();
 
         if len == 0 {
-            return Ok(0);
-        }
-
-        let num_to_read = if len < buf.len() { len } else { buf.len() };
-
-        if self.write_cursor < self.read_cursor {
-            // check if we need to wrap around the buffer to read num_to_read bytes
-            let num_to_end = self.buf.len() - self.read_cursor;
-            let min = if num_to_read < num_to_end {
-                num_to_read
-            } else {
-                num_to_end
-            };
-
-            unsafe { copy_nonoverlapping(&self.buf[self.read_cursor], &mut buf[0], min) };
-
-            if min != num_to_read {
-                unsafe { copy_nonoverlapping(&self.buf[0], &mut buf[min], num_to_read - min) };
-            }
+            Ok(0)
         } else {
-            unsafe { copy_nonoverlapping(&self.buf[self.read_cursor], &mut buf[0], num_to_read) };
+            let readed =
+                CircBuf::read_peek(&self.buf, buf, len, self.read_cursor, self.write_cursor)?;
+
+            self.advance_read(readed);
+
+            Ok(readed)
         }
-
-        self.advance_read(num_to_read);
-
-        Ok(num_to_read)
     }
 }
 
@@ -917,6 +977,24 @@ mod tests {
             assert_eq!(bufs[1].len(), 4);
             assert!(b"brickh".iter().zip(bufs[0].iter()).all(|(a, b)| a == b));
             assert!(b"ouse".iter().zip(bufs[1].iter()).all(|(a, b)| a == b));
+        }
+    }
+
+    #[test]
+    fn reader_peek() {
+        let data = &b"foo\nbar\nbaz\n"[..];
+        let mut c = CircBuf::with_capacity(data.len()).unwrap();
+
+        for _ in 0..42 {
+            c.write_all(data).unwrap();
+
+            let read_cursor = c.read_cursor;
+            let mut v = Vec::new();
+            let readed = std::io::copy(&mut c.reader_peek(), &mut v).unwrap() as usize;
+            assert_eq!(v, data);
+            assert_eq!(c.read_cursor, read_cursor);
+
+            c.advance_read(readed);
         }
     }
 
