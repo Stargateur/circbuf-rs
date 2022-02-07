@@ -532,13 +532,30 @@ pub struct CircBufPeekReader<'a> {
     peek_cursor: usize,
 }
 
-impl<'a> io::Read for CircBufPeekReader<'a> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let len = CircBuf::cacl_len(
+impl<'a> CircBufPeekReader<'a> {
+    /// Return the remaining number of bytes to peek
+    pub fn len(&self) -> usize {
+        CircBuf::cacl_len(
             self.peek_cursor,
             self.inner.write_cursor,
             self.inner.buf.len(),
-        );
+        )
+    }
+
+    /// Reset the peek cursor to the original read cursor of the inner `CircBuf`
+    pub fn reset(&mut self) {
+        self.peek_cursor = self.inner.read_cursor;
+    }
+
+    /// Return the number of bytes currently peeked. Useful to use for `CircBuf::advance_read`.
+    pub fn readed(&self) -> usize {
+        self.inner.len() - self.len()
+    }
+}
+
+impl<'a> io::Read for CircBufPeekReader<'a> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let len = self.len();
 
         if len == 0 {
             Ok(0)
@@ -990,7 +1007,10 @@ mod tests {
 
             let read_cursor = c.read_cursor;
             let mut v = Vec::new();
-            let readed = std::io::copy(&mut c.reader_peek(), &mut v).unwrap() as usize;
+            let mut peek_reader = c.reader_peek();
+            let readed = std::io::copy(&mut peek_reader, &mut v).unwrap() as usize;
+            assert_eq!(peek_reader.readed(), data.len());
+            assert_eq!(peek_reader.len(), 0);
             assert_eq!(v, data);
             assert_eq!(c.read_cursor, read_cursor);
 
